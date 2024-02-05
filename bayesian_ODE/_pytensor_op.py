@@ -1,11 +1,14 @@
 """Convert a jax function to a pytensor Op."""
 
 import inspect
+from collections.abc import Sequence
 
 import jax
 import numpy as np
 import pytensor.tensor as pt
+import pytensor.scalar as ps
 from jax.tree_util import tree_flatten, tree_unflatten
+import jax.numpy as jnp
 from pytensor.gradient import DisconnectedType
 from pytensor.graph import Apply, Op
 from pytensor.link.jax.dispatch import jax_funcify
@@ -14,9 +17,9 @@ from functools import partial
 
 def create_and_register_jax(
     jax_func,
-    output_types=(),
-    input_dtype="float64",
+    output_shape_func=None,
     name=None,
+    args_for_graph="all",
     static_argnums=(),
 ):
     """Return a pytensor from a jax jittable function.
@@ -30,10 +33,13 @@ def create_and_register_jax(
     ----------
     jax_func : jax jittable function
         function for which the node is created, can return multiple tensors as a tuple.
-    output_types : list of pt.TensorType
-        The shape of the TensorType has to be defined.
-    input_dtype : str
-        inputs are converted to this dtype
+    args_for_graph :
+        If "all", all arguments except arguments passed via **kwargs are used for the graph.
+    output_shape_func : function
+        Function that returns the shape of the output. If None, the shape is expected to
+        be the same as the shape of the args_for_graph arguments. If not None, the function
+        should return a tuple of shapes, it will receive as input the shapes of the args_for_graph
+        as tuples. Shapes are defined as tuples of integers or None.
     name: str
         Name of the created pytensor Op, defaults to the name of the passed function.
         Should be unique so that jax_juncify won't ovewrite another when registering it
@@ -43,84 +49,107 @@ def create_and_register_jax(
         and compilable with both JAX and C backend.
 
     """
-    jitted_sol_op_jax = partial(jax.jit, static_argnums=static_argnums)(jax_func)
-    len_gz = len(output_types)
-
-    def vjp_sol_op_jax(*args):
-        y0 = args[:-len_gz]
-        gz = args[-len_gz:]
-        if len(gz) == 1:
-            gz = gz[0]
-        _, vjp_fn = jax.vjp(sol_op.perform_jax, *y0)
-        if len(y0) == 1:
-            return vjp_fn(gz)[0]
-        else:
-            return vjp_fn(gz)
-
-    jitted_vjp_sol_op_jax = partial(jax.jit, static_argnums=static_argnums)(
-        vjp_sol_op_jax
-    )
 
     class SolOp(Op):
-        def __init__(self):
+        def __init__(
+            self,
+            input_treedef,
+            output_treeedef,
+            input_arg_names,
+            input_types,
+            output_types,
+            jitted_sol_op_jax,
+            jitted_vjp_sol_op_jax,
+            other_args,
+        ):
             self.vjp_sol_op = None
+            self.input_treedef = input_treedef
+            self.output_treedef = output_treeedef
+            self.input_arg_names = input_arg_names
+            self.input_types = input_types
+            self.output_types = output_types
+            self.jitted_sol_op_jax = jitted_sol_op_jax
+            self.jitted_vjp_sol_op_jax = jitted_vjp_sol_op_jax
+            self.other_args = other_args
 
-        def make_node(self, *inputs, **kwinputs):
-            # Convert keyword inputs to positional arguments
-            func_signature = inspect.signature(jax_func)
-            for key in kwinputs.keys():
-                if not key in func_signature.parameters:
-                    raise RuntimeError(
-                        f"Keyword argument <{key}> not found in function signature. "
-                        f"**kwargs are not supported in the definition of the function"
-                    )
-            arguments = func_signature.bind(*inputs, **kwinputs)
-            arguments.apply_defaults()
-            all_inputs = arguments.args
-
-            # Convert our inputs to symbolic variables
-            all_inputs_flat, self.input_tree = tree_flatten(all_inputs)
-            all_inputs_flat = [
-                pt.as_tensor_variable(inp).astype(input_dtype)
-                for inp in all_inputs_flat
-            ]
-            self.num_inputs = len(all_inputs_flat)
+        def make_node(self, *inputs):
+            self.num_inputs = len(inputs)
 
             # Define our output variables
-            outputs = [pt.as_tensor_variable(type()) for type in output_types]
+            outputs = [pt.as_tensor_variable(type()) for type in self.output_types]
+            self.num_outputs = len(outputs)
 
-            self.vjp_sol_op = VJPSolOp(self.input_tree)
+            self.vjp_sol_op = VJPSolOp(
+                self.input_treedef,
+                self.input_types,
+                self.jitted_vjp_sol_op_jax,
+                self.other_args,
+            )
 
-            return Apply(self, all_inputs_flat, outputs)
+            return Apply(self, inputs, outputs)
+
+        def perform_old(self, node, inputs, outputs):
+            # This function is called by the C backend, thus the numpy conversion.
+            inputs = tree_unflatten(self.input_treedef, inputs)
+
+            inputs_dic = {arg: val for arg, val in zip(self.input_arg_names, inputs)}
+            print(inputs_dic)
+
+            results = self.jitted_sol_op_jax(**inputs_dic, **self.other_args)
+            results, output_treedef_local = tree_flatten(results)
+            if output_treedef_local != self.output_treedef:
+                raise ValueError(
+                    f"The output of the jax function {output_treedef_local} does not match the tree definition "
+                    f"inferred from the output_shape_func: {self.output_treedef}. Please check the output_shape_func."
+                )
+
+            if self.num_outputs > 0:
+                for i in range(self.num_outputs):
+                    outputs[i][0] = np.array(results[i], self.output_types[i].dtype)
+            else:
+                outputs[0][0] = np.array(results, self.output_types[0].dtype)
 
         def perform(self, node, inputs, outputs):
-            # This function is called by the C backend, thus the numpy conversion.
-            inputs = tree_unflatten(self.input_tree, inputs)
-            results = jitted_sol_op_jax(*inputs)
-            if len(output_types) > 1:
-                for i, _ in enumerate(output_types):
-                    outputs[i][0] = np.array(results[i], output_types[i].dtype)
+            results = self.jitted_sol_op_jax(inputs, self.other_args)
+            if self.num_outputs > 1:
+                for i in range(self.num_outputs):
+                    outputs[i][0] = np.array(results[i], self.output_types[i].dtype)
             else:
-                outputs[0][0] = np.array(results, output_types[0].dtype)
+                outputs[0][0] = np.array(results, self.output_types[0].dtype)
 
-        def perform_jax(self, *inputs):
-            inputs = tree_unflatten(self.input_tree, inputs)
-            results = jitted_sol_op_jax(*inputs)
-            if len(output_types) > 1:
+        def perform_jax_old(self, *inputs):
+            inputs = tree_unflatten(self.input_treedef, inputs)
+
+            inputs_dic = {arg: val for arg, val in zip(self.input_arg_names, inputs)}
+            print(inputs_dic)
+            results = self.jitted_sol_op_jax(**inputs_dic, **self.other_args)
+            results, output_treedef_local = tree_flatten(results)
+            if output_treedef_local != self.output_treedef:
+                raise ValueError(
+                    f"The output of the jax function {output_treedef_local} does not match the tree definition"
+                    f"inferred from the output_shape_func: {self.output_treedef}. Please check the output_shape_func."
+                )
+            if self.num_outputs > 1:
                 return tuple(
                     results
                 )  # Transform to tuple because jax makes a difference between tuple and list
             else:
-                return results
+                return results[0]
 
-        def grad(self, inputs, output_gradients):
+        def perform_jax(self, *inputs):
+            results = self.jitted_sol_op_jax(inputs, self.other_args)
+            return results
+
+        def grad_old(self, inputs, output_gradients):
             # If a output is not used, it is disconnected and doesn't have a gradient.
             # Set gradient here to zero for those outputs.
-            for i, otype in enumerate(output_types):
+            # raise NotImplementedError()
+            for i in range(self.num_outputs):
                 if isinstance(output_gradients[i].type, DisconnectedType):
-                    output_gradients[i] = pt.zeros(otype.shape, otype.dtype)
+                    # output_gradients[i] = pt.zeros(otype.shape, otype.dtype)
+                    output_gradients[i] = pt.zeros((), self.output_types[i].dtype)
 
-            inputs_unflat = tree_unflatten(self.input_tree, inputs)
+            inputs_unflat = tree_unflatten(self.input_treedef, inputs)
             result = self.vjp_sol_op(inputs_unflat, output_gradients)
 
             if self.num_inputs > 1:
@@ -128,19 +157,43 @@ def create_and_register_jax(
             else:
                 return (result,)  # Pytensor requires a tuple here
 
+        def grad(self, inputs, output_gradients):
+            # If a output is not used, it is disconnected and doesn't have a gradient.
+            # Set gradient here to zero for those outputs.
+            # raise NotImplementedError()
+            for i in range(self.num_outputs):
+                if isinstance(output_gradients[i].type, DisconnectedType):
+                    # output_gradients[i] = pt.zeros(otype.shape, otype.dtype)
+                    output_gradients[i] = pt.zeros((), self.output_types[i].dtype)
+            result = self.vjp_sol_op(inputs, output_gradients)
+            if self.num_inputs > 1:
+                return result
+            else:
+                return (result,)  # Pytensor requires a tuple here
+
     # vector-jacobian product Op
     class VJPSolOp(Op):
-        def __init__(self, input_tree_def):
-            self.input_tree_def = input_tree_def
+        def __init__(
+            self, input_treedef, input_types, jitted_vjp_sol_op_jax, other_args
+        ):
+            self.input_treedef = input_treedef
+            self.input_types = input_types
+            self.jitted_vjp_sol_op_jax = jitted_vjp_sol_op_jax
+            self.other_args = other_args
 
-        def make_node(self, y0, gz):
-            y0_flat, self.input_tree_def = tree_flatten(y0)
+        def make_node_old(self, y0, gz):
+            y0_flat, local_input_treedef = tree_flatten(y0)
+            if local_input_treedef != self.input_treedef:
+                raise ValueError(
+                    f"The local {local_input_treedef} does not match the tree definition "
+                    f"from the forward function: {self.input_treedef}. Please open an issue"
+                )
 
             inputs = [
                 pt.as_tensor_variable(
                     _y,
-                ).astype(input_dtype)
-                for _y in y0_flat
+                ).astype(self.input_types[i].dtype)
+                for i, _y in enumerate(y0_flat)
             ] + [
                 pt.as_tensor_variable(
                     _gz,
@@ -149,48 +202,279 @@ def create_and_register_jax(
             ]
 
             # inputs_unflat = tuple(list(y0) + list(gz))
-            # _, self.full_input_tree_def = tree_flatten(inputs_unflat)
+            # _, self.full_input_treedef_def = tree_flatten(inputs_unflat)
 
-            outputs = [input.type() for input in y0_flat]
+            outputs = [in_type() for in_type in self.input_types]
             self.num_outputs = len(outputs)
+            print(len(outputs))
             return Apply(self, inputs, outputs)
 
-        def perform(self, node, inputs, outputs):
-            # inputs = tree_unflatten(self.full_input_tree_def, inputs)
-            results = jitted_vjp_sol_op_jax(*inputs)
-            results, _ = tree_flatten(results)
-            if self.num_outputs > 1:
-                for i, result in enumerate(results):
-                    outputs[i][0] = np.array(result, input_dtype)
-            else:
-                outputs[0][0] = np.array(results, input_dtype)
+        def make_node(self, y0, gz):
+            inputs = [
+                pt.as_tensor_variable(
+                    _y,
+                ).astype(self.input_types[i].dtype)
+                for i, _y in enumerate(y0)
+            ] + [
+                pt.as_tensor_variable(
+                    _gz,
+                )
+                for _gz in gz
+            ]
 
-        def perform_jax(self, *inputs):
-            # inputs = tree_unflatten(self.full_input_tree_def, inputs)
-            results = jitted_vjp_sol_op_jax(*inputs)
+            outputs = [in_type() for in_type in self.input_types]
+            self.num_outputs = len(outputs)
+            print(len(outputs))
+            return Apply(self, inputs, outputs)
+
+        def perform_old(self, node, inputs, outputs):
+            # inputs = tree_unflatten(self.full_input_treedef_def, inputs)
+            results = self.jitted_vjp_sol_op_jax(*inputs)
+            results, _ = tree_flatten(results)
+            for i, result in enumerate(results):
+                outputs[i][0] = np.array(results[i], self.input_types[i].dtype)
+
+        def perform(self, node, inputs, outputs):
+            # inputs = tree_unflatten(self.full_input_treedef_def, inputs)
+            results = self.jitted_vjp_sol_op_jax(tuple(inputs), self.other_args)
+            if len(self.input_types) > 1:
+                for i, result in enumerate(results):
+                    outputs[i][0] = np.array(results[i], self.input_types[i].dtype)
+            else:
+                outputs[0][0] = np.array(results, self.input_types[0].dtype)
+
+        def perform_jax_old(self, *inputs):
+            # inputs = tree_unflatten(self.full_input_treedef_def, inputs)
+
+            results = self.jitted_vjp_sol_op_jax(*inputs)
             results, _ = tree_flatten(results)
             if self.num_outputs == 1:
-                results = results[0]
-            return results
+                return results[0]
+            else:
+                return tuple(results)
 
-    if name is None:
-        name = jax_func.__name__
-    SolOp.__name__ = name
-    SolOp.__qualname__ = ".".join(SolOp.__qualname__.split(".")[:-1] + [name])
+        def perform_jax(self, *inputs):
+            # inputs = tree_unflatten(self.full_input_treedef_def, inputs)
 
-    VJPSolOp.__name__ = "VJP_" + name
-    VJPSolOp.__qualname__ = ".".join(
-        VJPSolOp.__qualname__.split(".")[:-1] + ["VJP_" + name]
-    )
+            results = self.jitted_vjp_sol_op_jax(tuple(inputs), self.other_args)
+            if self.num_outputs == 1:
+                if isinstance(results, Sequence):
+                    return results[0]
+                else:
+                    return results
+            else:
+                return tuple(results)
 
-    sol_op = SolOp()
+    def new_func(*args, **kwargs):
+        func_signature = inspect.signature(jax_func)
 
-    @jax_funcify.register(SolOp)
-    def sol_op_jax_funcify(op, **kwargs):
-        return sol_op.perform_jax
+        for key in kwargs.keys():
+            if not key in func_signature.parameters and key in args_for_graph:
+                raise RuntimeError(
+                    f"Keyword argument <{key}> not found in function signature. "
+                    f"**kwargs are not supported in the definition of the function,"
+                    f"because the order is not guaranteed."
+                )
+        arguments_bound = func_signature.bind(*args, **kwargs)
+        arguments_bound.apply_defaults()
 
-    @jax_funcify.register(VJPSolOp)
-    def vjp_sol_op_jax_funcify(op, **kwargs):
-        return sol_op.vjp_sol_op.perform_jax
+        # Check whether there exist an used **kwargs in the function signature
+        for arg_name in arguments_bound.signature.parameters:
+            if (
+                arguments_bound.signature.parameters[arg_name]
+                == inspect._ParameterKind.VAR_KEYWORD
+            ):
+                var_keyword = arg_name
+        else:
+            var_keyword = None
+        arg_names = [
+            key for key in arguments_bound.arguments.keys() if not key == var_keyword
+        ]
+        arg_names_from_kwargs = [key for key in arguments_bound.kwargs.keys()]
 
-    return sol_op
+        # all_inputs = arguments.args
+
+        if args_for_graph == "all":
+            args_for_graph_from_args = arg_names
+            args_for_graph_from_kwargs = arg_names_from_kwargs
+        else:
+            args_for_graph_from_args = []
+            args_for_graph_from_kwargs = []
+            for arg in args_for_graph:
+                if arg in arg_names:
+                    args_for_graph_from_args.append(arg)
+                elif arg in arg_names_from_kwargs:
+                    args_for_graph_from_kwargs.append(arg)
+                else:
+                    raise ValueError(
+                        f"Argument {arg} not found in the function signature."
+                    )
+
+        inputs_for_graph = [
+            arguments_bound.arguments[arg] for arg in args_for_graph_from_args
+        ]
+        inputs_for_graph += [
+            arguments_bound.kwargs[arg] for arg in args_for_graph_from_kwargs
+        ]
+        all_args_for_graph = args_for_graph_from_args + args_for_graph_from_kwargs
+        other_args_dic = {
+            arg: arguments_bound.arguments[arg]
+            for arg in arg_names
+            if not arg in all_args_for_graph
+        }
+        other_args_dic.update(
+            **{
+                arg: arguments_bound.kwargs[arg]
+                for arg in arg_names_from_kwargs
+                if not arg in all_args_for_graph
+            }
+        )
+
+        # Convert our inputs to symbolic variables
+        all_inputs_flat, input_treedef = tree_flatten(inputs_for_graph)
+        all_inputs_flat = [pt.as_tensor_variable(inp) for inp in all_inputs_flat]
+
+        input_types = [inp.type for inp in all_inputs_flat]
+
+        output_dtype = ps.upcast(*[inp_type.dtype for inp_type in input_types])
+
+        # len_gz = len(output_types)
+
+        nonlocal output_shape_func
+        if output_shape_func is None:
+            output_shape_func = lambda **shape_dic: tuple(shape_dic.values())
+
+        input_shapes_list = tree_unflatten(
+            input_treedef, [inp_type.shape for inp_type in input_types]
+        )
+        input_shapes_dic = {
+            arg: shape for arg, shape in zip(all_args_for_graph, input_shapes_list)
+        }
+
+        print(output_shape_func(**input_shapes_dic))
+
+        # For flattening the output shapes, we need to redefine what is a leaf, so that
+        # the shape tuples don't get also flattened.
+        is_leaf = lambda x: isinstance(x, Sequence) and (
+            len(x) == 0 or x[0] is None or isinstance(x[0], int)
+        )
+        output_shape = output_shape_func(**input_shapes_dic)
+        # if isinstance(output_shape, Sequence):
+        #    output_shape = tuple(output_shape)
+
+        output_shapes_flat, output_treedef = tree_flatten(output_shape, is_leaf=is_leaf)
+        # output_shapes_flat = tuple(output_shapes_flat)
+
+        if len(output_shapes_flat) == 0 or not isinstance(
+            output_shapes_flat[0], Sequence
+        ):
+            output_shapes_flat = (output_shapes_flat,)
+        print(output_shapes_flat)
+
+        output_types = [
+            pt.type.TensorType(dtype=output_dtype, shape=shape)
+            for shape in output_shapes_flat
+        ]
+        len_gz = len(output_types)
+
+        def conv_input_to_jax(func):
+            def new_func(inputs_for_graph, other_args_dic):
+                inputs_for_graph = tree_unflatten(input_treedef, inputs_for_graph)
+                inputs_for_graph = jax.tree_util.tree_map(
+                    lambda x: jnp.array(x), inputs_for_graph
+                )
+                inputs_for_graph_dic = {
+                    arg: val for arg, val in zip(all_args_for_graph, inputs_for_graph)
+                }
+                results = func(**inputs_for_graph_dic, **other_args_dic)
+                results, output_treedef_local = tree_flatten(results)
+                if output_treedef_local != output_treedef:
+                    raise ValueError(
+                        f"The output of the jax function {output_treedef_local} does not match the tree definition"
+                        f"inferred from the output_shape_func: {self.output_treedef}. Please check the output_shape_func."
+                    )
+                remove_size_one_dim = lambda x: x[0] if jnp.shape(x) == (1,) else x
+                results = jax.tree_map(remove_size_one_dim, results)
+                if len_gz > 1:
+                    return tuple(
+                        results
+                    )  # Transform to tuple because jax makes a difference between tuple and list
+                else:
+                    return results[0]
+
+            return new_func
+
+        jitted_sol_op_jax = partial(jax.jit, static_argnums=static_argnums)(
+            conv_input_to_jax(jax_func)
+        )
+
+        def vjp_sol_op_jax_old(*args):
+            y0 = args[:-len_gz]
+            gz = args[-len_gz:]
+            # gz = tree_unflatten(output_treedef, gz_flat)
+            if len(gz) == 1:
+                gz = gz[0]
+            _, vjp_fn = jax.vjp(local_op.perform_jax, *y0)
+            if len(y0) == 1:
+                return vjp_fn(gz)[0]
+            else:
+                return vjp_fn(gz)
+
+        def vjp_sol_op_jax(args, other_args_dic):
+            y0 = args[:-len_gz]
+            gz = args[-len_gz:]
+
+            remove_size_one_dim = lambda x: x[0] if jnp.shape(x) == (1,) else x
+            y0 = jax.tree_map(remove_size_one_dim, y0)
+            gz = jax.tree_map(remove_size_one_dim, gz)
+            # gz = tree_unflatten(output_treedef, gz_flat)
+            if len(gz) == 1:
+                gz = gz[0]
+            _, vjp_fn = jax.vjp(local_op.perform_jax, *y0)
+            if len(y0) == 1:
+                return vjp_fn(gz)[0]
+            else:
+                return tuple(vjp_fn(gz))
+
+        jitted_vjp_sol_op_jax = partial(
+            jax.jit, static_argnums=static_argnums, keep_unused=True
+        )(vjp_sol_op_jax)
+
+        nonlocal name
+        if name is None:
+            name = jax_func.__name__
+        SolOp.__name__ = name
+        SolOp.__qualname__ = ".".join(SolOp.__qualname__.split(".")[:-1] + [name])
+
+        VJPSolOp.__name__ = "VJP_" + name
+        VJPSolOp.__qualname__ = ".".join(
+            VJPSolOp.__qualname__.split(".")[:-1] + ["VJP_" + name]
+        )
+
+        local_op = SolOp(
+            input_treedef,
+            output_treedef,
+            input_arg_names=all_args_for_graph,
+            input_types=input_types,
+            output_types=output_types,
+            jitted_sol_op_jax=jitted_sol_op_jax,
+            jitted_vjp_sol_op_jax=jitted_vjp_sol_op_jax,
+            other_args=other_args_dic,
+        )
+
+        output_flat = local_op(*all_inputs_flat)
+        if not isinstance(output_flat, Sequence):
+            output_flat = [output_flat]  # tree_unflatten expects a sequence.
+        output = tree_unflatten(output_treedef, output_flat)
+
+        @jax_funcify.register(SolOp)
+        def sol_op_jax_funcify(op, **kwargs):
+            return local_op.perform_jax
+
+        @jax_funcify.register(VJPSolOp)
+        def vjp_sol_op_jax_funcify(op, **kwargs):
+            return local_op.vjp_sol_op.perform_jax
+
+        return output
+
+    return new_func
