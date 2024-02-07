@@ -103,7 +103,7 @@ def test_models():
     with pm.Model() as model8:
         x = pm.Normal("input", size=3)
         y = pm.Normal("input2", size=(1,))
-        y_tmp = {"y3": y, "y4": [y**2]}
+        y_tmp = {"a": y, "b": [y**2]}
 
         def f(x, y):
             jax.debug.print("x: {}", x)
@@ -122,28 +122,54 @@ def test_models():
         pm.Normal("obs", out_x, observed=(3, 2, 3))
         # pm.Normal("obs2", out_y["y3"], observed=(3,))
 
-    # 2 parameters input with pytree, pytree output
+    # 2 parameters input with pytree, pytree output and non-graph argument
     with pm.Model() as model9:
         x = pm.Normal("input", size=3)
         y = pm.Normal("input2", size=1)
-        y_tmp = {"y3": y, "y4": [y**2]}
+        y_tmp = {"a": y, "b": [y**2]}
 
         def f(x, y, non_model_arg):
             print(non_model_arg)
-            return x, jax.tree_map(jnp.exp, y)
+            return x, jax.tree_map(jax.nn.sigmoid, y)
 
         f_op = create_and_register_jax(
             f,
             output_shape_func=lambda x, y: (x, y),
             args_for_graph=["x", "y"],
-            static_argnums=(2,),
         )
         out_x, out_y = f_op(x, y_tmp, "Hello World!")
-        # raise RuntimeError()
-        # for_model = out_y["y3"]
-        pm.Normal("obs", out_x, observed=(3, 2, 3))
 
-    return model1, model2, model3, model4, model5, model6, model7, model8  # , model9
+        pm.Normal("obs", out_y["b"][0], observed=(3,))
+
+    with pm.Model() as model10:
+        x = pm.Normal("input", size=3)
+        y = pm.Normal("input2", size=3)
+        y_tmp = {"a": y, "b": [y**2]}
+
+        def f(x, y):
+            return x[:, None] @ y[None], x
+
+        f_op = create_and_register_jax(
+            f,
+            output_shape_func=lambda x, y: ((None, 3), x),
+            args_for_graph=["x", "y"],
+        )
+        out_x, out_y = f_op(x, y)
+
+        pm.Normal("obs", out_y[0], observed=(3,))
+
+    return (
+        model1,
+        model2,
+        model3,
+        model4,
+        model5,
+        model6,
+        model7,
+        model8,
+        model9,
+        model10,
+    )
 
 
 def test_jax_compilation(test_models):
