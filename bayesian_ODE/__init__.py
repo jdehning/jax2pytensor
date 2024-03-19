@@ -9,7 +9,8 @@ from ._comp_model import (
     interpolation_func,
 )
 
-from ._pytensor_op import create_and_register_jax
+from ._pytensor_op import jaxfunc_to_pytensor
+from ._diffeq import diffeqsolve
 
 from ._slow_modulation import priors_for_cps, sigmoidal_changepoints
 from ._tools import hierarchical_priors

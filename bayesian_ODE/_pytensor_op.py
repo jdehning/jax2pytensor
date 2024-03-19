@@ -15,27 +15,28 @@ from pytensor.link.jax.dispatch import jax_funcify
 from functools import partial
 
 
-def create_and_register_jax(
-    jax_func,
-    output_shape_func=None,
-    name=None,
+def jaxfunc_to_pytensor(
+    jaxfunc,
+    output_shape_def=None,
     args_for_graph="all",
-    static_argnums=(),
+    output_formatter=None,
+    name=None,
+    static_argnames=(),
 ):
     """Return a pytensor from a jax jittable function.
 
     It requires to define the output types of the returned values as pytensor types. A
-    unique name should also be passed in case the name of the jax_func is identical to
+    unique name should also be passed in case the name of the jaxfunc is identical to
     some other node. The design of this function is based on
     https://www.pymc-labs.io/blog-posts/jax-functions-in-pymc-3-quick-examples/
 
     Parameters
     ----------
-    jax_func : jax jittable function
+    jaxfunc : jax jittable function
         function for which the node is created, can return multiple tensors as a tuple.
     args_for_graph :
         If "all", all arguments except arguments passed via **kwargs are used for the graph.
-    output_shape_func : function
+    output_shape_def : function
         Function that returns the shape of the output. If None, the shape is expected to
         be the same as the shape of the args_for_graph arguments. If not None, the function
         should return a tuple of shapes, it will receive as input the shapes of the args_for_graph
@@ -89,7 +90,7 @@ def create_and_register_jax(
             return Apply(self, inputs, outputs)
 
         def perform(self, node, inputs, outputs):
-            results = self.jitted_sol_op_jax(inputs, **self.other_args)
+            results = self.jitted_sol_op_jax(inputs)
             if self.num_outputs > 1:
                 for i in range(self.num_outputs):
                     outputs[i][0] = np.array(results[i], self.output_types[i].dtype)
@@ -97,7 +98,7 @@ def create_and_register_jax(
                 outputs[0][0] = np.array(results, self.output_types[0].dtype)
 
         def perform_jax(self, *inputs):
-            results = self.jitted_sol_op_jax(inputs, **self.other_args)
+            results = self.jitted_sol_op_jax(inputs)
             return results
 
         def grad(self, inputs, output_gradients):
@@ -171,7 +172,7 @@ def create_and_register_jax(
                 return tuple(results)
 
     def new_func(*args, **kwargs):
-        func_signature = inspect.signature(jax_func)
+        func_signature = inspect.signature(jaxfunc)
 
         for key in kwargs.keys():
             if not key in func_signature.parameters and key in args_for_graph:
@@ -245,25 +246,25 @@ def create_and_register_jax(
 
         # len_gz = len(output_types)
 
-        nonlocal output_shape_func
-        if output_shape_func is None:
-            output_shape_func = lambda **shape_dic: tuple(shape_dic.values())
+        nonlocal output_shape_def
+        if output_shape_def is None:
+            output_shape_def = lambda **shape_dic: jax.tree_util.tree_map(
+                lambda x: x.shape, tuple(shape_dic.values())
+            )
 
-        input_shapes_list = tree_unflatten(
-            input_treedef, [inp_type.shape for inp_type in input_types]
-        )
-        input_shapes_dic = {
-            arg: shape for arg, shape in zip(all_args_for_graph, input_shapes_list)
+        input_types_list = tree_unflatten(input_treedef, input_types)
+        input_types_dic = {
+            arg: t for arg, t in zip(all_args_for_graph, input_types_list)
         }
 
-        print(output_shape_func(**input_shapes_dic))
+        print(output_shape_def(**input_types_dic))
 
         # For flattening the output shapes, we need to redefine what is a leaf, so that
         # the shape tuples don't get also flattened.
         is_leaf = lambda x: isinstance(x, Sequence) and (
             len(x) == 0 or x[0] is None or isinstance(x[0], int)
         )
-        output_shape = output_shape_func(**input_shapes_dic)
+        output_shape = output_shape_def(**input_types_dic)
         # if isinstance(output_shape, Sequence):
         #    output_shape = tuple(output_shape)
 
@@ -283,7 +284,7 @@ def create_and_register_jax(
         len_gz = len(output_types)
 
         def conv_input_to_jax(func):
-            def new_func(inputs_for_graph, **other_args_kwargs):
+            def new_func(inputs_for_graph):
                 inputs_for_graph = tree_unflatten(input_treedef, inputs_for_graph)
                 inputs_for_graph = jax.tree_util.tree_map(
                     lambda x: jnp.array(x), inputs_for_graph
@@ -292,11 +293,13 @@ def create_and_register_jax(
                     arg: val for arg, val in zip(all_args_for_graph, inputs_for_graph)
                 }
                 results = func(**inputs_for_graph_dic, **other_args_dic)
+                if output_formatter is not None:
+                    results = output_formatter(results)
                 results, output_treedef_local = tree_flatten(results)
                 if output_treedef_local != output_treedef:
                     raise ValueError(
                         f"The output of the jax function {output_treedef_local} does not match the tree definition"
-                        f"inferred from the output_shape_func: {self.output_treedef}. Please check the output_shape_func."
+                        f"inferred from the output_shape_def: {output_treedef}. Please check the output_shape_def."
                     )
                 # remove_size_one_dim = lambda x: x[0] if jnp.shape(x) == (1,) else x
                 # results = jax.tree_map(remove_size_one_dim, results)
@@ -310,7 +313,8 @@ def create_and_register_jax(
             return new_func
 
         jitted_sol_op_jax = jax.jit(
-            conv_input_to_jax(jax_func), static_argnames=tuple(other_args_dic.keys())
+            conv_input_to_jax(jaxfunc),
+            static_argnames=static_argnames,  # , static_argnames=tuple(other_args_dic.keys())
         )
 
         def vjp_sol_op_jax(args):
@@ -340,7 +344,7 @@ def create_and_register_jax(
 
         nonlocal name
         if name is None:
-            name = jax_func.__name__
+            name = jaxfunc.__name__
         SolOp.__name__ = name
         SolOp.__qualname__ = ".".join(SolOp.__qualname__.split(".")[:-1] + [name])
 

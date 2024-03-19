@@ -4,7 +4,7 @@ import diffrax
 from pytensor.tensor.type import TensorType
 import jax
 
-from ._pytensor_op import create_and_register_jax
+from ._pytensor_op import jaxfunc_to_pytensor
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ class ODEIntegrator:
         """
         integrator = self.get_func(ODE, list_keys_to_return=list_keys_to_return)
 
-        pytensor_op = create_and_register_jax(
+        pytensor_op = jaxfunc_to_pytensor(
             integrator,
             output_types=[
                 TensorType(
@@ -304,7 +304,7 @@ def interpolate_pytensor(
         else:
             return jax.vmap(interp.evaluate, 0, 0)(ts_out)
 
-    interpolator_op = create_and_register_jax(
+    interpolator_op = jaxfunc_to_pytensor(
         interpolator,
         output_types=[
             TensorType(dtype="float64", shape=(len(ts_out),)),
