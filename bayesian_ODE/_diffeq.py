@@ -13,7 +13,6 @@ def diffeqsolve(*other_args, **other_kwargs):
     func = jaxfunc_to_pytensor(
         diffrax.diffeqsolve,
         args_for_graph=["y0", "args"],
-        output_shape_def=lambda y0, args: jax.tree_util.tree_map(add_dim, y0),
         output_formatter=lambda solution: solution.ys,
     )
     return func(*other_args, **other_kwargs)

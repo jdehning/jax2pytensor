@@ -32,7 +32,7 @@ def test_models():
         def f2(x, y):
             return jax.nn.sigmoid(x + y)
 
-        f2_op = jaxfunc_to_pytensor(f2, output_shape_def=lambda x, y: x.shape)
+        f2_op = jaxfunc_to_pytensor(f2)
         out = f2_op(x, y)
         pm.Normal("obs", out, observed=3)
 
@@ -43,10 +43,7 @@ def test_models():
         def f(x, y):
             return [jax.nn.sigmoid(x + y), y * 2]
 
-        f_op = jaxfunc_to_pytensor(
-            f,
-            output_shape_def=lambda x, y: [x.shape, y.shape],
-        )
+        f_op = jaxfunc_to_pytensor(f)
         out, _ = f_op(x, y)
         pm.Normal("obs", out, observed=3)
 
@@ -58,7 +55,7 @@ def test_models():
         def f4(x):
             return jax.nn.sigmoid(x), x * 2
 
-        f4_op = jaxfunc_to_pytensor(f4, output_shape_def=lambda x: (x.shape, x.shape))
+        f4_op = jaxfunc_to_pytensor(f4)
         out, _ = f4_op(x)
         pm.Normal("obs", out, observed=3)
 
@@ -69,7 +66,7 @@ def test_models():
         def f5(x):
             return jax.nn.sigmoid(x), x
 
-        f5_op = jaxfunc_to_pytensor(f5, output_shape_def=lambda x: (x.shape, x.shape))
+        f5_op = jaxfunc_to_pytensor(f5)
         out, _ = f5_op(x)
         pm.Normal("obs", out, observed=3)
 
@@ -80,10 +77,7 @@ def test_models():
         def f(x):
             return [jax.nn.sigmoid(x), 2 * x]
 
-        f_op = jaxfunc_to_pytensor(
-            f,
-            output_shape_def=lambda x: [x.shape, x.shape],
-        )
+        f_op = jaxfunc_to_pytensor(f)
         out, _ = f_op(x)
         pm.Normal("obs", out, observed=3)
 
@@ -95,7 +89,7 @@ def test_models():
         def f(x, y):
             return jax.nn.sigmoid(x), 2 * x + y["y"] + y["y2"][0]
 
-        f_op = jaxfunc_to_pytensor(f, output_shape_def=lambda x, y: (x.shape, x.shape))
+        f_op = jaxfunc_to_pytensor(f)
         out, _ = f_op(x, y_tmp)
         pm.Normal("obs", out, observed=3)
 
@@ -112,11 +106,7 @@ def test_models():
                 lambda x: jnp.exp(x), y
             )  # {"a": y["y4"], "b": y["y3"]}  # , jax.tree_map(jnp.exp, y)
 
-        f_op = jaxfunc_to_pytensor(
-            f,
-            # output_shape_def=lambda x, y: (x, y)  # (x, {"a": [()], "b": ()})  # , y),
-            # args_for_graph=["x", "y"],
-        )
+        f_op = jaxfunc_to_pytensor(f)
         out_x, out_y = f_op(x, y_tmp)
         # for_model = out_y["y3"]
         pm.Normal("obs", out_x, observed=(3, 2, 3))
@@ -149,11 +139,7 @@ def test_models():
         def f(x, y):
             return x[:, None] @ y[None], x
 
-        f_op = jaxfunc_to_pytensor(
-            f,
-            output_shape_def=lambda x, y: ((None, 3), x.shape),
-            args_for_graph=["x", "y"],
-        )
+        f_op = jaxfunc_to_pytensor(f, args_for_graph=["x", "y"])
         out_x, out_y = f_op(x, y)
 
         pm.Normal("obs", out_y[0], observed=(3,))

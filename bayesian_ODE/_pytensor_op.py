@@ -6,18 +6,15 @@ from collections.abc import Sequence
 import jax
 import numpy as np
 import pytensor.tensor as pt
-import pytensor.scalar as ps
 from jax.tree_util import tree_flatten, tree_unflatten
 import jax.numpy as jnp
 from pytensor.gradient import DisconnectedType
 from pytensor.graph import Apply, Op
 from pytensor.link.jax.dispatch import jax_funcify
-from functools import partial
 
 
 def jaxfunc_to_pytensor(
     jaxfunc,
-    output_shape_def=None,
     args_for_graph="all",
     output_formatter=None,
     name=None,
@@ -34,16 +31,15 @@ def jaxfunc_to_pytensor(
     ----------
     jaxfunc : jax jittable function
         function for which the node is created, can return multiple tensors as a tuple.
-    args_for_graph :
+    args_for_graph : list of str or "all"
         If "all", all arguments except arguments passed via **kwargs are used for the graph.
-    output_shape_def : function
-        Function that returns the shape of the output. If None, the shape is expected to
-        be the same as the shape of the args_for_graph arguments. If not None, the function
-        should return a tuple of shapes, it will receive as input the shapes of the args_for_graph
-        as tuples. Shapes are defined as tuples of integers or None.
+        Otherwise specify a list of argument names to use for the graph.
+    output_formatter : function
+        The return parameters are passed through this function before being returned.
+        It is required that all return values are able to transformed to pytensor.TensorVariable.
+        Using this function, some return values can be discarded or transformed.
     name: str
         Name of the created pytensor Op, defaults to the name of the passed function.
-        Should be unique so that jax_juncify won't ovewrite another when registering it
     Returns
     -------
         A Pytensor Op which can be used in a pm.Model as function, is differentiable
@@ -51,6 +47,199 @@ def jaxfunc_to_pytensor(
 
     """
 
+    ### Construct the function to return that is compatible with both JAX and pytensor
+    def new_func(*args, **kwargs):
+        func_signature = inspect.signature(jaxfunc)
+
+        (
+            input_treedef,
+            input_arg_names,
+            input_types,
+            inputs_flat,
+            other_args_dic,
+        ) = _split_arguments(func_signature, args, kwargs, args_for_graph)
+
+        ### Create internal function that accepts flattened inputs to use for pytensor.
+        def conv_input_to_jax(func, flatten_output=True):
+            def new_func(inputs_for_graph):
+                inputs_for_graph = tree_unflatten(input_treedef, inputs_for_graph)
+                inputs_for_graph = jax.tree_util.tree_map(
+                    lambda x: jnp.array(x), inputs_for_graph
+                )
+                inputs_for_graph_dic = {
+                    arg: val for arg, val in zip(input_arg_names, inputs_for_graph)
+                }
+                results = func(**inputs_for_graph_dic, **other_args_dic)
+                if output_formatter is not None:
+                    results = output_formatter(results)
+                if not flatten_output:
+                    return results
+                else:
+                    results, output_treedef_local = tree_flatten(results)
+
+                    if len(results) > 1:
+                        return tuple(
+                            results
+                        )  # Transform to tuple because jax makes a difference between tuple and list and not pytensor
+                    else:
+                        return results[0]
+
+            return new_func
+
+        jitted_sol_op_jax = jax.jit(
+            conv_input_to_jax(jaxfunc),
+            static_argnames=static_argnames,
+        )
+
+        # Convert static_argnames to static_argnums because make_jaxpr requires it.
+        static_argnums = tuple(
+            i
+            for i, (k, param) in enumerate(func_signature.parameters.items())
+            if param.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+            and k in static_argnames
+        )
+
+        ### Infer output shape and type from jax function, it works by passing pt.TensorType
+        ### variables, as jax only needs type and shape information. Breaks if a shape
+        ### is None.
+        _, out_shape_jax = jax.make_jaxpr(
+            conv_input_to_jax(jaxfunc, flatten_output=False),
+            static_argnums=static_argnums,
+            return_shape=True,
+        )(jax.tree_map(lambda x: x.type, inputs_flat))
+
+        out_shape_jax_flat, output_treedef = tree_flatten(out_shape_jax)
+        output_types = [
+            pt.TensorType(dtype=var.dtype, shape=var.shape)
+            for var in out_shape_jax_flat
+        ]
+
+        ### Create the Pytensor Op, the normal one and the vector-jacobian product (vjp)
+        def vjp_sol_op_jax(args):
+            y0 = args[:-len_gz]
+            gz = args[-len_gz:]
+            if len(gz) == 1:
+                gz = gz[0]
+            primals, vjp_fn = jax.vjp(local_op.perform_jax, *y0)
+            if len(y0) == 1:
+                return vjp_fn(gz)[0]
+            else:
+                return tuple(vjp_fn(gz))
+
+        jitted_vjp_sol_op_jax = jax.jit(vjp_sol_op_jax)
+
+        nonlocal name
+        if name is None:
+            name = jaxfunc.__name__
+
+        SolOp, VJPSolOp = _return_pytensor_ops(name)
+
+        local_op = SolOp(
+            input_treedef,
+            output_treedef,
+            input_arg_names=input_arg_names,
+            input_types=input_types,
+            output_types=output_types,
+            jitted_sol_op_jax=jitted_sol_op_jax,
+            jitted_vjp_sol_op_jax=jitted_vjp_sol_op_jax,
+            other_args=other_args_dic,
+        )
+
+        @jax_funcify.register(SolOp)
+        def sol_op_jax_funcify(op, **kwargs):
+            return local_op.perform_jax
+
+        @jax_funcify.register(VJPSolOp)
+        def vjp_sol_op_jax_funcify(op, **kwargs):
+            return local_op.vjp_sol_op.perform_jax
+
+        ### Evaluate the Pytensor Op and return unflattened results
+        output_flat = local_op(*inputs_flat)
+        if not isinstance(output_flat, Sequence):
+            output_flat = [output_flat]  # tree_unflatten expects a sequence.
+        output = tree_unflatten(output_treedef, output_flat)
+        len_gz = len(output_types)
+
+        return output
+
+    return new_func
+
+
+def _split_arguments(func_signature, args, kwargs, args_for_graph):
+    for key in kwargs.keys():
+        if not key in func_signature.parameters and key in args_for_graph:
+            raise RuntimeError(
+                f"Keyword argument <{key}> not found in function signature. "
+                f"**kwargs are not supported in the definition of the function,"
+                f"because the order is not guaranteed."
+            )
+    arguments_bound = func_signature.bind(*args, **kwargs)
+    arguments_bound.apply_defaults()
+
+    # Check whether there exist an used **kwargs in the function signature
+    for arg_name in arguments_bound.signature.parameters:
+        if (
+            arguments_bound.signature.parameters[arg_name]
+            == inspect._ParameterKind.VAR_KEYWORD
+        ):
+            var_keyword = arg_name
+    else:
+        var_keyword = None
+    arg_names = [
+        key for key in arguments_bound.arguments.keys() if not key == var_keyword
+    ]
+    arg_names_from_kwargs = [key for key in arguments_bound.kwargs.keys()]
+
+    if args_for_graph == "all":
+        args_for_graph_from_args = arg_names
+        args_for_graph_from_kwargs = arg_names_from_kwargs
+    else:
+        args_for_graph_from_args = []
+        args_for_graph_from_kwargs = []
+        for arg in args_for_graph:
+            if arg in arg_names:
+                args_for_graph_from_args.append(arg)
+            elif arg in arg_names_from_kwargs:
+                args_for_graph_from_kwargs.append(arg)
+            else:
+                raise ValueError(f"Argument {arg} not found in the function signature.")
+
+    inputs_for_graph = [
+        arguments_bound.arguments[arg] for arg in args_for_graph_from_args
+    ]
+    inputs_for_graph += [
+        arguments_bound.kwargs[arg] for arg in args_for_graph_from_kwargs
+    ]
+    input_arg_names = args_for_graph_from_args + args_for_graph_from_kwargs
+    other_args_dic = {
+        arg: arguments_bound.arguments[arg]
+        for arg in arg_names
+        if not arg in input_arg_names
+    }
+    other_args_dic.update(
+        **{
+            arg: arguments_bound.kwargs[arg]
+            for arg in arg_names_from_kwargs
+            if not arg in input_arg_names
+        }
+    )
+
+    # Convert our inputs to symbolic variables
+    inputs_flat, input_treedef = tree_flatten(inputs_for_graph)
+    inputs_flat = [pt.as_tensor_variable(inp) for inp in inputs_flat]
+
+    input_types = [inp.type for inp in inputs_flat]
+
+    return (
+        input_treedef,
+        input_arg_names,
+        input_types,
+        inputs_flat,
+        other_args_dic,
+    )
+
+
+def _return_pytensor_ops(name):
     class SolOp(Op):
         def __init__(
             self,
@@ -107,11 +296,9 @@ def jaxfunc_to_pytensor(
             # raise NotImplementedError()
             for i in range(self.num_outputs):
                 if isinstance(output_gradients[i].type, DisconnectedType):
-                    #        # output_gradients[i] = pt.zeros(otype.shape, otype.dtype)
-                    #        output_gradients[i] = pt.zeros(
-                    #            self.output_types[i].shape, self.output_types[i].dtype
-                    #        )
-                    output_gradients[i] = pt.zeros((), self.output_types[i].dtype)
+                    output_gradients[i] = pt.zeros(
+                        self.output_types[i].shape, self.output_types[i].dtype
+                    )
             result = self.vjp_sol_op(inputs, output_gradients)
 
             if self.num_inputs > 1:
@@ -145,7 +332,6 @@ def jaxfunc_to_pytensor(
 
             outputs = [in_type() for in_type in self.input_types]
             self.num_outputs = len(outputs)
-            print(len(outputs))
             return Apply(self, y0 + gz_not_disconntected, outputs)
 
         def perform(self, node, inputs, outputs):
@@ -171,212 +357,12 @@ def jaxfunc_to_pytensor(
             else:
                 return tuple(results)
 
-    def new_func(*args, **kwargs):
-        func_signature = inspect.signature(jaxfunc)
+    SolOp.__name__ = name
+    SolOp.__qualname__ = ".".join(SolOp.__qualname__.split(".")[:-1] + [name])
 
-        for key in kwargs.keys():
-            if not key in func_signature.parameters and key in args_for_graph:
-                raise RuntimeError(
-                    f"Keyword argument <{key}> not found in function signature. "
-                    f"**kwargs are not supported in the definition of the function,"
-                    f"because the order is not guaranteed."
-                )
-        arguments_bound = func_signature.bind(*args, **kwargs)
-        arguments_bound.apply_defaults()
+    VJPSolOp.__name__ = "VJP_" + name
+    VJPSolOp.__qualname__ = ".".join(
+        VJPSolOp.__qualname__.split(".")[:-1] + ["VJP_" + name]
+    )
 
-        # Check whether there exist an used **kwargs in the function signature
-        for arg_name in arguments_bound.signature.parameters:
-            if (
-                arguments_bound.signature.parameters[arg_name]
-                == inspect._ParameterKind.VAR_KEYWORD
-            ):
-                var_keyword = arg_name
-        else:
-            var_keyword = None
-        arg_names = [
-            key for key in arguments_bound.arguments.keys() if not key == var_keyword
-        ]
-        arg_names_from_kwargs = [key for key in arguments_bound.kwargs.keys()]
-
-        # all_inputs = arguments.args
-
-        if args_for_graph == "all":
-            args_for_graph_from_args = arg_names
-            args_for_graph_from_kwargs = arg_names_from_kwargs
-        else:
-            args_for_graph_from_args = []
-            args_for_graph_from_kwargs = []
-            for arg in args_for_graph:
-                if arg in arg_names:
-                    args_for_graph_from_args.append(arg)
-                elif arg in arg_names_from_kwargs:
-                    args_for_graph_from_kwargs.append(arg)
-                else:
-                    raise ValueError(
-                        f"Argument {arg} not found in the function signature."
-                    )
-
-        inputs_for_graph = [
-            arguments_bound.arguments[arg] for arg in args_for_graph_from_args
-        ]
-        inputs_for_graph += [
-            arguments_bound.kwargs[arg] for arg in args_for_graph_from_kwargs
-        ]
-        all_args_for_graph = args_for_graph_from_args + args_for_graph_from_kwargs
-        other_args_dic = {
-            arg: arguments_bound.arguments[arg]
-            for arg in arg_names
-            if not arg in all_args_for_graph
-        }
-        other_args_dic.update(
-            **{
-                arg: arguments_bound.kwargs[arg]
-                for arg in arg_names_from_kwargs
-                if not arg in all_args_for_graph
-            }
-        )
-
-        # Convert our inputs to symbolic variables
-        all_inputs_flat, input_treedef = tree_flatten(inputs_for_graph)
-        all_inputs_flat = [pt.as_tensor_variable(inp) for inp in all_inputs_flat]
-
-        input_types = [inp.type for inp in all_inputs_flat]
-
-        output_dtype = ps.upcast(*[inp_type.dtype for inp_type in input_types])
-
-        # len_gz = len(output_types)
-
-        nonlocal output_shape_def
-        if output_shape_def is None:
-            output_shape_def = lambda **shape_dic: jax.tree_util.tree_map(
-                lambda x: x.shape, tuple(shape_dic.values())
-            )
-
-        input_types_list = tree_unflatten(input_treedef, input_types)
-        input_types_dic = {
-            arg: t for arg, t in zip(all_args_for_graph, input_types_list)
-        }
-
-        print(output_shape_def(**input_types_dic))
-
-        # For flattening the output shapes, we need to redefine what is a leaf, so that
-        # the shape tuples don't get also flattened.
-        is_leaf = lambda x: isinstance(x, Sequence) and (
-            len(x) == 0 or x[0] is None or isinstance(x[0], int)
-        )
-        output_shape = output_shape_def(**input_types_dic)
-        # if isinstance(output_shape, Sequence):
-        #    output_shape = tuple(output_shape)
-
-        output_shapes_flat, output_treedef = tree_flatten(output_shape, is_leaf=is_leaf)
-        # output_shapes_flat = tuple(output_shapes_flat)
-
-        if len(output_shapes_flat) == 0 or not isinstance(
-            output_shapes_flat[0], Sequence
-        ):
-            output_shapes_flat = (output_shapes_flat,)
-        print(output_shapes_flat)
-
-        output_types = [
-            pt.type.TensorType(dtype=output_dtype, shape=shape)
-            for shape in output_shapes_flat
-        ]
-        len_gz = len(output_types)
-
-        def conv_input_to_jax(func):
-            def new_func(inputs_for_graph):
-                inputs_for_graph = tree_unflatten(input_treedef, inputs_for_graph)
-                inputs_for_graph = jax.tree_util.tree_map(
-                    lambda x: jnp.array(x), inputs_for_graph
-                )
-                inputs_for_graph_dic = {
-                    arg: val for arg, val in zip(all_args_for_graph, inputs_for_graph)
-                }
-                results = func(**inputs_for_graph_dic, **other_args_dic)
-                if output_formatter is not None:
-                    results = output_formatter(results)
-                results, output_treedef_local = tree_flatten(results)
-                if output_treedef_local != output_treedef:
-                    raise ValueError(
-                        f"The output of the jax function {output_treedef_local} does not match the tree definition"
-                        f"inferred from the output_shape_def: {output_treedef}. Please check the output_shape_def."
-                    )
-                # remove_size_one_dim = lambda x: x[0] if jnp.shape(x) == (1,) else x
-                # results = jax.tree_map(remove_size_one_dim, results)
-                if len_gz > 1:
-                    return tuple(
-                        results
-                    )  # Transform to tuple because jax makes a difference between tuple and list
-                else:
-                    return results[0]
-
-            return new_func
-
-        jitted_sol_op_jax = jax.jit(
-            conv_input_to_jax(jaxfunc),
-            static_argnames=static_argnames,  # , static_argnames=tuple(other_args_dic.keys())
-        )
-
-        def vjp_sol_op_jax(args):
-            y0 = args[:-len_gz]
-            gz = args[-len_gz:]
-            # for i, gz_i in enumerate(gz):
-            #    if jnp.shape(gz_i) == ():
-            #        gz_i = jnp.where(jnp.isnan(gz_i), jnp.zeros_like(y0[i]), gz_i)
-
-            # remove_size_one_dim = lambda x: x[0] if jnp.shape(x) == (1,) else x
-            # y0 = jax.tree_map(remove_size_one_dim, y0)
-            # gz = jax.tree_map(remove_size_one_dim, gz)
-
-            # gz = tree_unflatten(output_treedef, gz_flat)
-            if len(gz) == 1:
-                gz = gz[0]
-            primals, vjp_fn = jax.vjp(local_op.perform_jax, *y0)
-            gz = jax.tree_util.tree_map(
-                lambda g, primal: jnp.broadcast_to(g, jnp.shape(primal)), gz, primals
-            )
-            if len(y0) == 1:
-                return vjp_fn(gz)[0]
-            else:
-                return tuple(vjp_fn(gz))
-
-        jitted_vjp_sol_op_jax = jax.jit(vjp_sol_op_jax)
-
-        nonlocal name
-        if name is None:
-            name = jaxfunc.__name__
-        SolOp.__name__ = name
-        SolOp.__qualname__ = ".".join(SolOp.__qualname__.split(".")[:-1] + [name])
-
-        VJPSolOp.__name__ = "VJP_" + name
-        VJPSolOp.__qualname__ = ".".join(
-            VJPSolOp.__qualname__.split(".")[:-1] + ["VJP_" + name]
-        )
-
-        local_op = SolOp(
-            input_treedef,
-            output_treedef,
-            input_arg_names=all_args_for_graph,
-            input_types=input_types,
-            output_types=output_types,
-            jitted_sol_op_jax=jitted_sol_op_jax,
-            jitted_vjp_sol_op_jax=jitted_vjp_sol_op_jax,
-            other_args=other_args_dic,
-        )
-
-        output_flat = local_op(*all_inputs_flat)
-        if not isinstance(output_flat, Sequence):
-            output_flat = [output_flat]  # tree_unflatten expects a sequence.
-        output = tree_unflatten(output_treedef, output_flat)
-
-        @jax_funcify.register(SolOp)
-        def sol_op_jax_funcify(op, **kwargs):
-            return local_op.perform_jax
-
-        @jax_funcify.register(VJPSolOp)
-        def vjp_sol_op_jax_funcify(op, **kwargs):
-            return local_op.vjp_sol_op.perform_jax
-
-        return output
-
-    return new_func
+    return SolOp, VJPSolOp
