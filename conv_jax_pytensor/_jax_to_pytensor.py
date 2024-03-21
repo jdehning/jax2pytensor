@@ -16,7 +16,7 @@ from pytensor.link.jax.dispatch import jax_funcify
 log = logging.getLogger(__name__)
 
 
-def jaxfunc_to_pytensor(
+def jax_to_pytensor(
     jaxfunc,
     args_for_graph="all",
     output_formatter=None,
@@ -50,7 +50,7 @@ def jaxfunc_to_pytensor(
 
     """
 
-    ### Construct the function to return that is compatible with both JAX and pytensor
+    ### Construct the function to return that is compatible with pytensor but has the same signature as the jax function.
     def new_func(*args, **kwargs):
         func_signature = inspect.signature(jaxfunc)
 

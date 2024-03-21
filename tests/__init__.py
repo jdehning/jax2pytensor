@@ -1,1 +1,1 @@
-"""Unit test package for bayesian_ODE."""
+"""Unit test package for conv_jax_pytensor."""

@@ -3,22 +3,14 @@
 """Inference of Compartmental Models Toolbox."""
 from importlib import metadata as importlib_metadata
 
-from ._comp_model import (
-    ODEIntegrator,
-    interpolate_pytensor,
-    interpolation_func,
-)
 
-from ._pytensor_op import jaxfunc_to_pytensor
+from ._jax_to_pytensor import jax_to_pytensor
 from ._diffeq import diffeqsolve
-
-from ._slow_modulation import priors_for_cps, sigmoidal_changepoints
-from ._tools import hierarchical_priors
 
 
 def _get_version():
     try:
-        return importlib_metadata.version("bayesian_ODE")
+        return importlib_metadata.version("conv_jax_pytensor")
     except importlib_metadata.PackageNotFoundError:
         return "unknown"
 

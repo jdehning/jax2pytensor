@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "bayesian_ODE"
+name = "conv_jax_pytensor"
 authors = [
   { name = "Jonas Dehning", email = "jonas.dehning@ds.mpg.de" },
 ]
@@ -47,10 +47,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jdehning/bayesian_ODE"
-"Bug Tracker" = "https://github.com/jdehning/bayesian_ODE/issues"
-Discussions = "https://github.com/jdehning/bayesian_ODE/discussions"
-Changelog = "https://github.com/jdehning/bayesian_ODE/releases"
+Homepage = "https://github.com/jdehning/conv-jax-pytensor"
+"Bug Tracker" = "https://github.com/jdehning/conv-jax-pytensor/issues"
+Discussions = "https://github.com/jdehning/conv-jax-pytensor/discussions"
+Changelog = "https://github.com/jdehning/conv-jax-pytensor/releases"
 
 
 [tool.pytest.ini_options]
@@ -77,7 +77,7 @@ skip_glob = ["docs/*", "*.egg-info"]
 [tool.ruff]
 line-length = 88
 force-exclude = true
-src = ["bayesian_ODE"]
+src = ["conv_jax_pytensor"]
 exclude = [
   'docs',
 ]
@@ -92,9 +92,9 @@ convention = "numpy"
 no_strict_optional = false
 
 [tool.setuptools]
-packages = ["bayesian_ODE"]
+packages = ["conv_jax_pytensor"]
 
 [tool.setuptools_scm]
-write_to = "bayesian_ODE/_version.py"
+write_to = "conv_jax_pytensor/_version.py"
 
 

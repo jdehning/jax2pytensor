@@ -102,4 +102,4 @@ docs/_templates/
 # IDE settings
 .vscode/
 .idea/
-/bayesian_ODE/_version.py
+/conv_jax_pytensor/_version.py

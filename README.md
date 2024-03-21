@@ -1,20 +1,16 @@
-# Bayesian ODE
+# Conv-Jax-Pytensor
 
-This toolbox aims to simplify the construction ODEs and the inference of their parameters.
+This tool transform [JAX](https://jax.readthedocs.io/en/latest/) functions into 
+[PyTensor](https://pytensor.readthedocs.io/en/latest/) compatible functions.
+Based on the 
 
-The aim isn't to provide a complete package that will build models from A to Z, but rather
-provide different helper functions examples and guidelines to help leverage modern python
-packages like [JAX](https://jax.readthedocs.io/en/latest/),
-[Diffrax](https://docs.kidger.site/diffrax/) and
-[PyMC](https://www.pymc.io/welcome.html) to build, automatically differentiate and fit
-compartmental models.
-
-* Documentation: https://bayesian_ode.readthedocs.io.
+* Documentation: https://conv-jax-pytensor.readthedocs.io.
 
 ## Features
 
-* Integrate the ODEs using diffrax, automatically generating the Jacobian of the parameters of the ODE
-* Fit the parameters using minimization algorithms or build a Bayesian model using PyMC.
+* Backward differenciation of the transformed function works.
+* Arguments and return values can be arbitrary nested python structures (pytrees).
+* Automatic inference of the shape and structure of return values, needed for PyTensor.
 
 
 
