@@ -1,11 +1,11 @@
 .DEFAULT_GOAL := help
 
 
-PACKAGE_PATH="conv_jax_pytensor"
+PACKAGE_PATH="jax2pytensor"
 
 SPHINXOPTS    =
 SPHINXBUILD   = python-msphinx
-SPHINXPROJ    = conv_jax_pytensor
+SPHINXPROJ    = jax2pytensor
 SOURCEDIR     = docs/
 BUILDDIR      = docs/_build
 

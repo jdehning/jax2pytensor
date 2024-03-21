@@ -102,4 +102,4 @@ docs/_templates/
 # IDE settings
 .vscode/
 .idea/
-/conv_jax_pytensor/_version.py
+/jax2pytensor/_version.py

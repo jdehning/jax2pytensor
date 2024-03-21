@@ -1,1 +1,1 @@
-"""Unit test package for conv_jax_pytensor."""
+"""Unit test package for jax2pytensor."""

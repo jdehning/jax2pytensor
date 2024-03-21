@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "conv_jax_pytensor"
+name = "jax2pytensor"
 authors = [
   { name = "Jonas Dehning", email = "jonas.dehning@ds.mpg.de" },
 ]
@@ -47,10 +47,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jdehning/conv-jax-pytensor"
-"Bug Tracker" = "https://github.com/jdehning/conv-jax-pytensor/issues"
-Discussions = "https://github.com/jdehning/conv-jax-pytensor/discussions"
-Changelog = "https://github.com/jdehning/conv-jax-pytensor/releases"
+Homepage = "https://github.com/jdehning/jax2pytensor"
+"Bug Tracker" = "https://github.com/jdehning/jax2pytensor/issues"
+Discussions = "https://github.com/jdehning/jax2pytensor/discussions"
+Changelog = "https://github.com/jdehning/jax2pytensor/releases"
 
 
 [tool.pytest.ini_options]
@@ -77,7 +77,7 @@ skip_glob = ["docs/*", "*.egg-info"]
 [tool.ruff]
 line-length = 88
 force-exclude = true
-src = ["conv_jax_pytensor"]
+src = ["jax2pytensor"]
 exclude = [
   'docs',
 ]
@@ -92,9 +92,9 @@ convention = "numpy"
 no_strict_optional = false
 
 [tool.setuptools]
-packages = ["conv_jax_pytensor"]
+packages = ["jax2pytensor"]
 
 [tool.setuptools_scm]
-write_to = "conv_jax_pytensor/_version.py"
+write_to = "jax2pytensor/_version.py"
 
 

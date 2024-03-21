@@ -1,14 +1,14 @@
 import diffrax
 import jax
 
-from ._jax_to_pytensor import jax_to_pytensor
+from ._jax2pytensor import jax2pytensor
 
 
 def diffeqsolve(*other_args, **other_kwargs):
     """
     Solve the ODE system with initial conditions y0 and parameters params
     """
-    func = jax_to_pytensor(
+    func = jax2pytensor(
         diffrax.diffeqsolve,
         args_for_graph=["y0", "args"],
         output_formatter=lambda solution: solution.ys,

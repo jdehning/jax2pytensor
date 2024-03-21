@@ -1,4 +1,4 @@
-"""Convert a jax function to a pytensor Op."""
+"""Convert a jax function to a pytensor compatible function."""
 
 import inspect
 from collections.abc import Sequence
@@ -16,7 +16,7 @@ from pytensor.link.jax.dispatch import jax_funcify
 log = logging.getLogger(__name__)
 
 
-def jax_to_pytensor(
+def jax2pytensor(
     jaxfunc,
     args_for_graph="all",
     output_formatter=None,

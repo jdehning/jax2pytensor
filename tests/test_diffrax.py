@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import diffrax
 import numpy as np
 
-from conv_jax_pytensor import diffeqsolve
+from jax2pytensor import diffeqsolve
 
 
 @pytest.fixture

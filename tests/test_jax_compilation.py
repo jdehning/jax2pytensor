@@ -1,5 +1,5 @@
 """
-Tests for conv_jax_pytensor package.
+Tests for jax2pytensor package.
 """
 import pytest
 
@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import pytensor
 import pytensor.tensor as pt
 
-from conv_jax_pytensor import jax_to_pytensor
+from jax2pytensor import jax_to_pytensor
 
 
 @pytest.fixture

@@ -4,13 +4,13 @@
 from importlib import metadata as importlib_metadata
 
 
-from ._jax_to_pytensor import jax_to_pytensor
+from ._jax2pytensor import jax2pytensor
 from ._diffeq import diffeqsolve
 
 
 def _get_version():
     try:
-        return importlib_metadata.version("conv_jax_pytensor")
+        return importlib_metadata.version("jax2pytensor")
     except importlib_metadata.PackageNotFoundError:
         return "unknown"
 
