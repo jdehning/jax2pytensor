@@ -2,6 +2,7 @@
 
 import inspect
 from collections.abc import Sequence
+import logging
 
 import jax
 import numpy as np
@@ -11,6 +12,8 @@ import jax.numpy as jnp
 from pytensor.gradient import DisconnectedType
 from pytensor.graph import Apply, Op
 from pytensor.link.jax.dispatch import jax_funcify
+
+log = logging.getLogger(__name__)
 
 
 def jaxfunc_to_pytensor(
@@ -100,17 +103,41 @@ def jaxfunc_to_pytensor(
         )
 
         ### Infer output shape and type from jax function, it works by passing pt.TensorType
-        ### variables, as jax only needs type and shape information. Breaks if a shape
-        ### is None.
+        ### variables, as jax only needs type and shape information.
+        input_types_w_neg_dim = []
+        neg_dim_out = False
+        for i, type in enumerate(input_types):
+            if None in type.shape:
+                # Replace None in shape with very negative number, as jax does not support
+                # None in shape. By filtering afterwards for negative number, the dimensions
+                # with unknown shape can be recovered again.
+                shape_new = tuple(
+                    [-1_000_000_000 if dim is None else dim for dim in type.shape]
+                )
+                type_new = pt.TensorType(dtype=type.dtype, shape=shape_new)
+                input_types_w_neg_dim.append(type_new)
+                log.warning(
+                    f"A dimension of input {i} is undefined: {type.shape}. The "
+                    "transformation to pytensor might work, but it is experimental. "
+                    "To remove this warning, specify the shapes of the inputs by"
+                    "assigning input.type.shape = (dim1, dim2, ...)."
+                )
+                neg_dim_out = True
+            else:
+                input_types_w_neg_dim.append(type)
+
         _, out_shape_jax = jax.make_jaxpr(
             conv_input_to_jax(jaxfunc, flatten_output=False),
             static_argnums=static_argnums,
             return_shape=True,
-        )(jax.tree_map(lambda x: x.type, inputs_flat))
+        )(input_types_w_neg_dim)
 
         out_shape_jax_flat, output_treedef = tree_flatten(out_shape_jax)
         output_types = [
-            pt.TensorType(dtype=var.dtype, shape=var.shape)
+            pt.TensorType(
+                dtype=var.dtype,
+                shape=tuple([None if d <= 0 and neg_dim_out else d for d in var.shape]),
+            )
             for var in out_shape_jax_flat
         ]
 
@@ -121,6 +148,9 @@ def jaxfunc_to_pytensor(
             if len(gz) == 1:
                 gz = gz[0]
             primals, vjp_fn = jax.vjp(local_op.perform_jax, *y0)
+            gz = jax.tree_util.tree_map(
+                lambda g, primal: jnp.broadcast_to(g, jnp.shape(primal)), gz, primals
+            )
             if len(y0) == 1:
                 return vjp_fn(gz)[0]
             else:
@@ -296,9 +326,12 @@ def _return_pytensor_ops(name):
             # raise NotImplementedError()
             for i in range(self.num_outputs):
                 if isinstance(output_gradients[i].type, DisconnectedType):
-                    output_gradients[i] = pt.zeros(
-                        self.output_types[i].shape, self.output_types[i].dtype
-                    )
+                    if not None in self.output_types[i].shape:
+                        output_gradients[i] = pt.zeros(
+                            self.output_types[i].shape, self.output_types[i].dtype
+                        )
+                    else:
+                        output_gradients[i] = pt.zeros((), self.output_types[i].dtype)
             result = self.vjp_sol_op(inputs, output_gradients)
 
             if self.num_inputs > 1:

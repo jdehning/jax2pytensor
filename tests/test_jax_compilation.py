@@ -3,11 +3,11 @@ Tests for bayesian_ODE package.
 """
 import pytest
 
-# import jax
 import pymc as pm
 import jax
 import jax.numpy as jnp
-from pytensor.tensor.type import TensorType
+import pytensor
+import pytensor.tensor as pt
 
 from bayesian_ODE import jaxfunc_to_pytensor
 
@@ -50,7 +50,6 @@ def test_models():
     # single 1d input, tuple output
     with pm.Model() as model4:
         x, y = pm.Normal("input", size=2)
-        print(x.shape)
 
         def f4(x):
             return jax.nn.sigmoid(x), x * 2
@@ -134,7 +133,6 @@ def test_models():
     with pm.Model() as model10:
         x = pm.Normal("input", size=3)
         y = pm.Normal("input2", size=3)
-        y_tmp = {"a": y, "b": [y**2]}
 
         def f(x, y):
             return x[:, None] @ y[None], x
@@ -143,6 +141,38 @@ def test_models():
         out_x, out_y = f_op(x, y)
 
         pm.Normal("obs", out_y[0], observed=(3,))
+
+    with pm.Model() as model11:
+        x = pm.Normal("input", size=3)
+        y = pm.Normal("input2", size=3)
+
+        # Now x has an unknown shape
+        x, _ = pytensor.map(pt.exp, [x])
+
+        def f11(x, y):
+            return x[:, None] @ y[None]
+
+        f_op = jaxfunc_to_pytensor(f11)
+        out_x = f_op(x, y)
+        # out_x = x[:, None] @ y[None]
+
+        pm.Normal("obs", out_x[0, 1], observed=2)
+
+    with pm.Model() as model12:
+        x = pm.Normal("input", size=3)
+        y = pm.Normal("input2", size=3)
+
+        # Now x has an unknown shape
+        x, _ = pytensor.map(pt.exp, [x])
+
+        def f12(x, y):
+            return jnp.concatenate([x, jnp.ones(10)])
+
+        f_op = jaxfunc_to_pytensor(f12)
+        out_x = f_op(x, y)
+        # out_x = x[:, None] @ y[None]
+
+        pm.Normal("obs", out_x[0], observed=2)
 
     return (
         model1,
@@ -155,6 +185,8 @@ def test_models():
         model8,
         model9,
         model10,
+        model11,
+        model12,
     )
 
 
