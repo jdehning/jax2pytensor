@@ -12,8 +12,27 @@ import jax.numpy as jnp
 from pytensor.gradient import DisconnectedType
 from pytensor.graph import Apply, Op
 from pytensor.link.jax.dispatch import jax_funcify
+import jax.experimental.export.shape_poly
+
 
 log = logging.getLogger(__name__)
+
+
+class UnknDim(int):
+    def __new__(cls):
+        return super(cls, cls).__new__(cls, 1)
+
+    def __add__(self, other):
+        return self.__class__()
+
+    def __sub__(self, other):
+        return self.__class__()
+
+    def __mul__(self, other):
+        return self.__class__()
+
+    def __div__(self, other):
+        return self.__class__()
 
 
 def jax2pytensor(
@@ -105,24 +124,35 @@ def jax2pytensor(
         ### Infer output shape and type from jax function, it works by passing pt.TensorType
         ### variables, as jax only needs type and shape information.
         input_types_w_neg_dim = []
-        neg_dim_out = False
+        current_char = "a"
         for i, type in enumerate(input_types):
             if None in type.shape:
                 # Replace None in shape with very negative number, as jax does not support
                 # None in shape. By filtering afterwards for negative number, the dimensions
                 # with unknown shape can be recovered again.
-                shape_new = tuple(
-                    [-1_000_000_000 if dim is None else dim for dim in type.shape]
-                )
-                type_new = pt.TensorType(dtype=type.dtype, shape=shape_new)
+
+                # shape_new = tuple(
+                #    [UnknDim() if dim is None else dim for dim in type.shape]
+                # )
+                str_shape = "("
+                for dim in type.shape:
+                    if dim is None:
+                        str_shape += current_char
+                        current_char = chr(ord(current_char) + 1)
+                    else:
+                        str_shape += str(dim)
+                    str_shape += ", "
+                str_shape = str_shape[:-2] + ")"
+                shape_new = jax.experimental.export.shape_poly.symbolic_shape(str_shape)
+
+                type_new = jax.core.ShapedArray(shape_new, type.dtype)
+                # type_new = pt.TensorType(dtype=type.dtype, shape=shape_new)
                 input_types_w_neg_dim.append(type_new)
                 log.warning(
                     f"A dimension of input {i} is undefined: {type.shape}. The "
                     "transformation to pytensor might work, but it is experimental. "
-                    "To remove this warning, specify the shapes of the inputs by"
-                    "assigning input.type.shape = (dim1, dim2, ...)."
+                    "Open an issue if it does not work."
                 )
-                neg_dim_out = True
             else:
                 input_types_w_neg_dim.append(type)
 
@@ -136,10 +166,14 @@ def jax2pytensor(
         output_types = [
             pt.TensorType(
                 dtype=var.dtype,
-                shape=tuple([None if d <= 0 and neg_dim_out else d for d in var.shape]),
+                shape=tuple(
+                    [None if jax._src.core.is_symbolic_dim(d) else d for d in var.shape]
+                ),
             )
             for var in out_shape_jax_flat
         ]
+        # if not current_char == "a":
+        #    raise RuntimeError("Test")
 
         ### Create the Pytensor Op, the normal one and the vector-jacobian product (vjp)
         def vjp_sol_op_jax(args):
