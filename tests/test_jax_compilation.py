@@ -148,6 +148,7 @@ def test_models():
 
         # Now x has an unknown shape
         x, _ = pytensor.map(pt.exp, [x])
+        x.type.shape = (3,)
 
         def f11(x, y):
             return x[:, None] @ y[None]
@@ -158,15 +159,20 @@ def test_models():
 
         pm.Normal("obs", out_x[0, 1], observed=2)
 
+    # Test broadcasting with unknown shape
     with pm.Model() as model12:
         x = pm.Normal("input", size=3)
         y = pm.Normal("input2", size=3)
 
+        shape_before = x.type.shape
+
         # Now x has an unknown shape
-        x, _ = pytensor.map(pt.exp, [x])
+        x = pt.cumsum(x)
+
+        x.type.shape = shape_before
 
         def f12(x, y):
-            return jnp.concatenate([x, jnp.ones(10)])
+            return x * jnp.ones(3)
 
         f_op = jax2pytensor(f12)
         out_x = f_op(x, y)
@@ -174,10 +180,11 @@ def test_models():
 
         pm.Normal("obs", out_x[0], observed=2)
 
-    # Test broadcasting with unknown shape
-    with pm.Model() as model12:
+    with pm.Model() as model13:
         x = pm.Normal("input", size=3)
         y = pm.Normal("input2", size=3)
+
+        shape_before = x.type.shape
 
         # Now x has an unknown shape
         x = pt.cumsum(x)
@@ -185,7 +192,7 @@ def test_models():
         def f12(x, y):
             return x * jnp.ones(3)
 
-        f_op = jax2pytensor(f12)
+        f_op = jax2pytensor(f12, output_shape_def=lambda **_: (3,))
         out_x = f_op(x, y)
         # out_x = x[:, None] @ y[None]
 
@@ -204,6 +211,7 @@ def test_models():
         model10,
         model11,
         model12,
+        model13,
     )
 
 

@@ -7,36 +7,22 @@ import logging
 import jax
 import numpy as np
 import pytensor.tensor as pt
-from jax.tree_util import tree_flatten, tree_unflatten
+import pytensor.scalar as ps
+
+from jax.tree_util import tree_flatten, tree_unflatten, tree_map, tree_leaves
+
+# import jax.tree
 import jax.numpy as jnp
 from pytensor.gradient import DisconnectedType
 from pytensor.graph import Apply, Op
 from pytensor.link.jax.dispatch import jax_funcify
-import jax.experimental.export.shape_poly
-
 
 log = logging.getLogger(__name__)
 
 
-class UnknDim(int):
-    def __new__(cls):
-        return super(cls, cls).__new__(cls, 1)
-
-    def __add__(self, other):
-        return self.__class__()
-
-    def __sub__(self, other):
-        return self.__class__()
-
-    def __mul__(self, other):
-        return self.__class__()
-
-    def __div__(self, other):
-        return self.__class__()
-
-
 def jax2pytensor(
     jaxfunc,
+    output_shape_def=None,
     args_for_graph="all",
     output_formatter=None,
     name=None,
@@ -53,6 +39,11 @@ def jax2pytensor(
     ----------
     jaxfunc : jax jittable function
         function for which the node is created, can return multiple tensors as a tuple.
+    output_shape_def : function
+        Function that returns the shape of the output. If None, the shape is expected to
+        be the same as the shape of the args_for_graph arguments. If not None, the function
+        should return a tuple of shapes, it will receive as input the shapes of the args_for_graph
+        as tuples. Shapes are defined as tuples of integers or None.
     args_for_graph : list of str or "all"
         If "all", all arguments except arguments passed via **kwargs are used for the graph.
         Otherwise specify a list of argument names to use for the graph.
@@ -74,22 +65,25 @@ def jax2pytensor(
         func_signature = inspect.signature(jaxfunc)
 
         (
-            input_treedef,
-            input_arg_names,
-            input_types,
-            inputs_flat,
+            inputs_list,
+            inputnames_list,
             other_args_dic,
         ) = _split_arguments(func_signature, args, kwargs, args_for_graph)
 
+        # Convert our inputs to symbolic variables
+        inputs_flat, input_treedef = tree_flatten(inputs_list)
+        inputs_flat = [pt.as_tensor_variable(inp) for inp in inputs_flat]
+        input_types_flat = [inp.type for inp in inputs_flat]
+
         ### Create internal function that accepts flattened inputs to use for pytensor.
         def conv_input_to_jax(func, flatten_output=True):
-            def new_func(inputs_for_graph):
-                inputs_for_graph = tree_unflatten(input_treedef, inputs_for_graph)
+            def new_func(inputs_list_flat):
+                inputs_for_graph = tree_unflatten(input_treedef, inputs_list_flat)
                 inputs_for_graph = jax.tree_util.tree_map(
                     lambda x: jnp.array(x), inputs_for_graph
                 )
                 inputs_for_graph_dic = {
-                    arg: val for arg, val in zip(input_arg_names, inputs_for_graph)
+                    arg: val for arg, val in zip(inputnames_list, inputs_for_graph)
                 }
                 results = func(**inputs_for_graph_dic, **other_args_dic)
                 if output_formatter is not None:
@@ -121,59 +115,60 @@ def jax2pytensor(
             and k in static_argnames
         )
 
-        ### Infer output shape and type from jax function, it works by passing pt.TensorType
-        ### variables, as jax only needs type and shape information.
-        input_types_w_neg_dim = []
-        current_char = "a"
-        for i, type in enumerate(input_types):
-            if None in type.shape:
-                # Replace None in shape with very negative number, as jax does not support
-                # None in shape. By filtering afterwards for negative number, the dimensions
-                # with unknown shape can be recovered again.
+        for input_var, inputname in zip(inputs_list, inputnames_list):
+            for i, input_elem in enumerate(tree_leaves(input_var)):
+                type = input_elem.type
+                if None in type.shape:
+                    if output_shape_def is None:
+                        raise RuntimeError(
+                            f"A dimension of input {inputname}, element {i} is undefined: {type.shape} "
+                            "You need to provide the output_shape_def function to define the shape of the output, or "
+                            "set the shape of the tensor to a integer with input_var.type.shape = (10,) for example."
+                        )
 
-                # shape_new = tuple(
-                #    [UnknDim() if dim is None else dim for dim in type.shape]
-                # )
-                str_shape = "("
-                for dim in type.shape:
-                    if dim is None:
-                        str_shape += current_char
-                        current_char = chr(ord(current_char) + 1)
-                    else:
-                        str_shape += str(dim)
-                    str_shape += ", "
-                str_shape = str_shape[:-2] + ")"
-                shape_new = jax.experimental.export.shape_poly.symbolic_shape(str_shape)
+        if output_shape_def is not None:
+            input_types_list = tree_unflatten(input_treedef, input_types_flat)
+            input_types_dic = {
+                arg: t for arg, t in zip(inputnames_list, input_types_list)
+            }
+            output_shape = output_shape_def(**input_types_dic)
 
-                type_new = jax.core.ShapedArray(shape_new, type.dtype)
-                # type_new = pt.TensorType(dtype=type.dtype, shape=shape_new)
-                input_types_w_neg_dim.append(type_new)
-                log.warning(
-                    f"A dimension of input {i} is undefined: {type.shape}. The "
-                    "transformation to pytensor might work, but it is experimental. "
-                    "Open an issue if it does not work."
-                )
-            else:
-                input_types_w_neg_dim.append(type)
-
-        _, out_shape_jax = jax.make_jaxpr(
-            conv_input_to_jax(jaxfunc, flatten_output=False),
-            static_argnums=static_argnums,
-            return_shape=True,
-        )(input_types_w_neg_dim)
-
-        out_shape_jax_flat, output_treedef = tree_flatten(out_shape_jax)
-        output_types = [
-            pt.TensorType(
-                dtype=var.dtype,
-                shape=tuple(
-                    [None if jax._src.core.is_symbolic_dim(d) else d for d in var.shape]
-                ),
+            # For flattening the output shapes, we need to redefine what is a leaf, so that
+            # the shape tuples don't get also flattened.
+            is_leaf = lambda x: isinstance(x, Sequence) and (
+                len(x) == 0 or x[0] is None or isinstance(x[0], int)
             )
-            for var in out_shape_jax_flat
-        ]
-        # if not current_char == "a":
-        #    raise RuntimeError("Test")
+            output_shapes_flat, output_treedef = tree_flatten(
+                output_shape, is_leaf=is_leaf
+            )
+
+            if len(output_shapes_flat) == 0 or not isinstance(
+                output_shapes_flat[0], Sequence
+            ):
+                output_shapes_flat = (output_shapes_flat,)
+
+            output_dtype = ps.upcast(*[inp_type.dtype for inp_type in input_types_flat])
+
+            output_types = [
+                pt.type.TensorType(dtype=output_dtype, shape=shape)
+                for shape in output_shapes_flat
+            ]
+
+        else:
+            ### Infer output shape and type from jax function, it works by passing pt.TensorType
+            ### variables, as jax only needs type and shape information.
+            _, output_shape_jax = jax.make_jaxpr(
+                conv_input_to_jax(jaxfunc, flatten_output=False),
+                static_argnums=static_argnums,
+                return_shape=True,
+            )(tree_map(lambda x: x.type, inputs_flat))
+
+            out_shape_jax_flat, output_treedef = tree_flatten(output_shape_jax)
+
+            output_types = [
+                pt.TensorType(dtype=var.dtype, shape=var.shape)
+                for var in out_shape_jax_flat
+            ]
 
         ### Create the Pytensor Op, the normal one and the vector-jacobian product (vjp)
         def vjp_sol_op_jax(args):
@@ -201,8 +196,8 @@ def jax2pytensor(
         local_op = SolOp(
             input_treedef,
             output_treedef,
-            input_arg_names=input_arg_names,
-            input_types=input_types,
+            input_arg_names=inputnames_list,
+            input_types=input_types_flat,
             output_types=output_types,
             jitted_sol_op_jax=jitted_sol_op_jax,
             jitted_vjp_sol_op_jax=jitted_vjp_sol_op_jax,
@@ -268,37 +263,30 @@ def _split_arguments(func_signature, args, kwargs, args_for_graph):
             else:
                 raise ValueError(f"Argument {arg} not found in the function signature.")
 
-    inputs_for_graph = [
+    inputs_for_graph_list = [
         arguments_bound.arguments[arg] for arg in args_for_graph_from_args
     ]
-    inputs_for_graph += [
+    inputs_for_graph_list += [
         arguments_bound.kwargs[arg] for arg in args_for_graph_from_kwargs
     ]
-    input_arg_names = args_for_graph_from_args + args_for_graph_from_kwargs
+    inputnames_for_graph_list = args_for_graph_from_args + args_for_graph_from_kwargs
+
     other_args_dic = {
         arg: arguments_bound.arguments[arg]
         for arg in arg_names
-        if not arg in input_arg_names
+        if not arg in inputnames_for_graph_list
     }
     other_args_dic.update(
         **{
             arg: arguments_bound.kwargs[arg]
             for arg in arg_names_from_kwargs
-            if not arg in input_arg_names
+            if not arg in inputnames_for_graph_list
         }
     )
 
-    # Convert our inputs to symbolic variables
-    inputs_flat, input_treedef = tree_flatten(inputs_for_graph)
-    inputs_flat = [pt.as_tensor_variable(inp) for inp in inputs_flat]
-
-    input_types = [inp.type for inp in inputs_flat]
-
     return (
-        input_treedef,
-        input_arg_names,
-        input_types,
-        inputs_flat,
+        inputs_for_graph_list,
+        inputnames_for_graph_list,
         other_args_dic,
     )
 
