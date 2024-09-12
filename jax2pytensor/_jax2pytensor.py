@@ -24,7 +24,6 @@ def jax2pytensor(
     jaxfunc,
     output_shape_def=None,
     args_for_graph="all",
-    output_formatter=None,
     name=None,
     static_argnames=(),
 ):
@@ -39,6 +38,7 @@ def jax2pytensor(
     ----------
     jaxfunc : jax jittable function
         function for which the node is created, can return multiple tensors as a tuple.
+        It is required that all return values are able to transformed to pytensor.TensorVariable.
     output_shape_def : function
         Function that returns the shape of the output. If None, the shape is expected to
         be the same as the shape of the args_for_graph arguments. If not None, the function
@@ -47,10 +47,6 @@ def jax2pytensor(
     args_for_graph : list of str or "all"
         If "all", all arguments except arguments passed via **kwargs are used for the graph.
         Otherwise specify a list of argument names to use for the graph.
-    output_formatter : function
-        The return parameters are passed through this function before being returned.
-        It is required that all return values are able to transformed to pytensor.TensorVariable.
-        Using this function, some return values can be discarded or transformed.
     name: str
         Name of the created pytensor Op, defaults to the name of the passed function.
     Returns
@@ -86,8 +82,6 @@ def jax2pytensor(
                     arg: val for arg, val in zip(inputnames_list, inputs_for_graph)
                 }
                 results = func(**inputs_for_graph_dic, **other_args_dic)
-                if output_formatter is not None:
-                    results = output_formatter(results)
                 if not flatten_output:
                     return results
                 else:
